@@ -488,28 +488,6 @@
       <div class="section-title">Ahorro acumulado (histórico)</div>
       <div class="grid" style="grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;" id="savings-summary"></div>
 
-      <div class="card" id="use-savings-card" style="margin-bottom:16px;">
-        <h3>💸 Usar ahorro / amortización</h3>
-        <p class="note" id="us-available" style="margin-top:0;"></p>
-        <div class="inline-form" style="border-top:none;padding-top:0;margin-top:8px;">
-          <select id="us-bucket">
-            <option value="ahorro_mensual">Ahorro</option>
-            <option value="ahorro_amortizacion">Amortización para préstamo</option>
-          </select>
-          <input type="text" id="us-concept" placeholder="Concepto (ej: Viaje a Roma)">
-          <input type="text" id="us-category" list="us-category-list" placeholder="Categoría (ej: Viajes)" style="width:150px;flex:none;">
-          <datalist id="us-category-list"></datalist>
-          <input type="date" id="us-date">
-          <input type="number" step="0.01" min="0.01" id="us-amount" placeholder="Monto €" style="width:100px;">
-          <select id="us-account"></select>
-          <label style="font-size:12px;color:var(--ink-soft);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="us-extra" checked style="width:auto;"> Extraordinario (no cuenta en el promedio diario)</label>
-          <button id="us-apply">Usar ahorro</button>
-        </div>
-        <p class="note">Se registra el gasto real en Movimientos y se resta ese monto de tu ahorro acumulado, las dos cosas juntas. Si la plata ya estaba guardada aparte (fuera de los saldos de arriba), elegí "fuera de mis cuentas" para no descontarla dos veces del saldo.</p>
-        <div id="us-status" class="note"></div>
-        <div id="us-history"></div>
-      </div>
-
       <div class="grid" style="grid-template-columns:1fr 1fr;gap:16px;">
         <div class="chart-wrap"><h3>Ahorro por mes</h3><canvas id="chart-savings"></canvas></div>
         <div class="chart-wrap"><h3>Acumulado en el tiempo</h3><canvas id="chart-savings-cumulative"></canvas></div>
@@ -868,7 +846,14 @@ function computeLiveBudget(){
 
 function populateAccountSelects(){
   const opts = DATA.accounts.map(a=>`<option value="${a.id}">${a.name}</option>`).join('');
-  ['qi-account','tr-from','tr-to','mr-account','am-account'].forEach(id=>{ const el = document.getElementById(id); if(el) el.innerHTML = opts; });
+  ['qi-account','mr-account','am-account'].forEach(id=>{ const el = document.getElementById(id); if(el) el.innerHTML = opts; });
+  // En transferencias, "Ahorro" también es un lugar al que se puede mandar o del que se puede sacar plata
+  ['tr-from','tr-to'].forEach(id=>{
+    const el = document.getElementById(id); if(!el) return;
+    const prev = el.value;
+    el.innerHTML = opts + '<option value="__ahorro__">💰 Ahorro</option>';
+    if(prev && Array.from(el.options).some(o=>o.value===prev)) el.value = prev;
+  });
 }
 
 /* ---------------- SHARED BALANCE-REVERSAL HELPERS ---------------- */
@@ -1086,17 +1071,40 @@ document.getElementById('qi-add').addEventListener('click', async ()=>{
   await refreshAll();
 });
 
+let trBusy = false;
 document.getElementById('tr-add').addEventListener('click', async ()=>{
+  if(trBusy) return;
   const fromId = document.getElementById('tr-from').value;
   const toId = document.getElementById('tr-to').value;
-  const amount = parseFloat(document.getElementById('tr-amount').value);
-  if(!fromId || !toId || !amount) return;
-  if(fromId===toId){ alert('Elegí dos cuentas distintas.'); return; }
-  await adjustAccountBalance(fromId, -amount);
-  await adjustAccountBalance(toId, amount);
-  await sb.from('transfers').insert({ date: todayISO(), from_account_id: fromId, to_account_id: toId, amount });
-  document.getElementById('tr-amount').value='';
-  await refreshAll();
+  const amount = Math.round(parseFloat(document.getElementById('tr-amount').value) * 100) / 100;
+  if(!fromId || !toId || !(amount > 0)) return;
+  if(fromId===toId){ alert('Elegí dos lugares distintos.'); return; }
+  trBusy = true;
+  try{
+    const AH = '__ahorro__';
+    if(fromId===AH || toId===AH){
+      // Cuenta ↔ Ahorro: se mueve el saldo de la cuenta y se anota en el histórico de ahorro (que se ve en Estadísticas)
+      const accountId = fromId===AH ? toId : fromId;
+      const aAhorro = toId===AH;
+      if(!aAhorro){
+        const pool = DATA.savingsLedger.filter(s=>s.bucket==='ahorro_mensual').reduce((t,x)=>t+Number(x.amount),0);
+        if(amount > pool + 0.005){ alert('No alcanza: en Ahorro hay ' + fmt(pool) + '.'); return; }
+      }
+      const { error } = await sb.from('savings_ledger').insert({
+        date: todayISO(), bucket:'ahorro_mensual', amount: aAhorro ? amount : -amount,
+        source:'transferencia', note: aAhorro ? 'Transferencia a ahorro' : 'Transferencia desde ahorro',
+        account_id: accountId
+      });
+      if(error){ alert('No se pudo registrar: ' + error.message); return; }
+      await adjustAccountBalance(accountId, aAhorro ? -amount : amount);
+    } else {
+      await adjustAccountBalance(fromId, -amount);
+      await adjustAccountBalance(toId, amount);
+      await sb.from('transfers').insert({ date: todayISO(), from_account_id: fromId, to_account_id: toId, amount });
+    }
+    document.getElementById('tr-amount').value='';
+    await refreshAll();
+  } finally { trBusy = false; }
 });
 
 /* ---------------- CALENDARIO ---------------- */
@@ -1535,122 +1543,7 @@ function renderStats(){
   renderSavings();
 }
 
-/* ---------------- USAR AHORRO / AMORTIZACIÓN ---------------- */
-const US_BUCKET_LABEL = { ahorro_mensual:'Ahorro', ahorro_amortizacion:'Amortización' };
-function savingsPool(bucket){
-  return DATA.savingsLedger.filter(s=>s.bucket===bucket).reduce((s,x)=>s+Number(x.amount),0);
-}
-
-function renderUseSavings(){
-  const avail = document.getElementById('us-available');
-  if(!avail) return;
-  avail.textContent = `Disponible para usar → Ahorro: ${fmt(savingsPool('ahorro_mensual'))} · Amortización: ${fmt(savingsPool('ahorro_amortizacion'))}`;
-
-  const accSel = document.getElementById('us-account');
-  const prevAcc = accSel.value;
-  accSel.innerHTML = DATA.accounts.map(a=>`<option value="${a.id}">Sale de ${a.name} (descuenta el saldo)</option>`).join('')
-    + '<option value="__none__">Estaba aparte, fuera de mis cuentas (no toca ningún saldo)</option>';
-  if(prevAcc && Array.from(accSel.options).some(o=>o.value===prevAcc)) accSel.value = prevAcc;
-
-  const dateEl = document.getElementById('us-date');
-  if(!dateEl.value) dateEl.value = todayISO();
-
-  const cats = Array.from(new Set(DATA.expenses.map(e=>e.category).filter(Boolean))).sort();
-  document.getElementById('us-category-list').innerHTML = cats.map(c=>`<option value="${String(c).replace(/"/g,'&quot;')}">`).join('');
-
-  // Historial de retiros (usos de ahorro y amortizaciones aplicadas a deudas)
-  const uses = DATA.savingsLedger.filter(s=>Number(s.amount)<0).sort((a,b)=> a.date < b.date ? 1 : (a.date > b.date ? -1 : 0));
-  const hist = document.getElementById('us-history');
-  if(uses.length===0){ hist.innerHTML = ''; return; }
-  hist.innerHTML = `
-    <div class="card" style="padding:0;overflow:auto;margin-top:14px;">
-      <table>
-        <thead><tr><th>Fecha</th><th>Bolsillo</th><th>Concepto</th><th>Cuenta</th><th style="text-align:right">Monto</th><th></th></tr></thead>
-        <tbody>${uses.map(s=>{
-          const esUso = !!s.expense_id && DATA.expenses.some(e=>e.id===s.expense_id);
-          const origen = s.source==='aplicado_a_deuda' ? ' <span class="pill ok">deuda</span>' : '';
-          return `<tr data-expense="${s.expense_id||''}">
-            <td>${s.date}</td>
-            <td>${US_BUCKET_LABEL[s.bucket]||s.bucket}</td>
-            <td>${s.note||'—'}${origen}</td>
-            <td>${s.account_id ? accName(s.account_id) : 'fuera de cuentas'}</td>
-            <td class="amt">${fmt(s.amount)}</td>
-            <td>${esUso ? '<button class="btn-icon us-undo" title="Deshacer este uso">×</button>' : ''}</td>
-          </tr>`;
-        }).join('')}</tbody>
-      </table>
-    </div>`;
-
-  hist.querySelectorAll('.us-undo').forEach(btn=>btn.addEventListener('click', async (e)=>{
-    const id = e.target.closest('tr').dataset.expense;
-    const exp = DATA.expenses.find(x=>x.id===id);
-    if(!exp) return;
-    if(!confirm('¿Deshacer este uso de ahorro? Se borra el gasto de Movimientos, el dinero vuelve a tu ahorro (y a la cuenta, si había salido de una).')) return;
-    await reverseExpenseEffect(exp);
-    await sb.from('expenses').delete().eq('id', id); // el retiro del ahorro se borra solo (ON DELETE CASCADE)
-    await refreshAll();
-  }));
-}
-
-let usBusy = false;
-document.getElementById('us-apply').addEventListener('click', async ()=>{
-  if(usBusy) return;
-  const btn = document.getElementById('us-apply');
-  const status = document.getElementById('us-status');
-  status.style.color = 'var(--rust)';
-
-  const bucket = document.getElementById('us-bucket').value;
-  const concept = document.getElementById('us-concept').value.trim();
-  const category = document.getElementById('us-category').value.trim() || 'Ahorro usado';
-  const date = document.getElementById('us-date').value || todayISO();
-  const amount = Math.round(parseFloat(document.getElementById('us-amount').value) * 100) / 100;
-  const accSel = document.getElementById('us-account').value;
-  const accountId = (accSel && accSel !== '__none__') ? accSel : null;
-  const extra = document.getElementById('us-extra').checked;
-
-  if(!concept){ status.textContent = 'Poné un concepto (ej: Viaje a Roma).'; return; }
-  if(!(amount > 0)){ status.textContent = 'Poné un monto mayor a cero.'; return; }
-  const pool = savingsPool(bucket);
-  if(amount > pool + 0.005){
-    status.textContent = `No alcanza: en ${US_BUCKET_LABEL[bucket]} hay ${fmt(pool)} y querés usar ${fmt(amount)}.`;
-    return;
-  }
-
-  usBusy = true; btn.disabled = true; status.textContent = 'Registrando...';
-  try{
-    // 1) El gasto real, visible en Movimientos
-    const { data: exp, error: e1 } = await sb.from('expenses')
-      .insert({ date, category, product: concept, amount, account_id: accountId, excluded_from_budget: extra, quantity: 1 })
-      .select().single();
-    if(e1) throw new Error('No se pudo registrar el gasto: ' + e1.message);
-
-    // 2) El retiro del ahorro (negativo), enlazado a ese gasto
-    const { error: e2 } = await sb.from('savings_ledger')
-      .insert({ date, bucket, amount: -amount, source: 'uso_ahorro', note: concept, account_id: accountId, expense_id: exp.id });
-    if(e2){
-      await sb.from('expenses').delete().eq('id', exp.id); // si falla el segundo paso, no queda nada a medias
-      throw new Error('No se pudo restar del ahorro: ' + e2.message);
-    }
-
-    // 3) Recién ahora, con todo guardado, se descuenta el saldo de la cuenta elegida
-    if(accountId) await adjustAccountBalance(accountId, -amount);
-
-    document.getElementById('us-concept').value = '';
-    document.getElementById('us-category').value = '';
-    document.getElementById('us-amount').value = '';
-    await refreshAll();
-    status.style.color = 'var(--teal)';
-    status.textContent = `✔ Listo: ${fmt(amount)} de ${US_BUCKET_LABEL[bucket]} para "${concept}". Ya aparece en Movimientos y se restó de tu ahorro.`;
-  } catch(err){
-    status.style.color = 'var(--rust)';
-    status.textContent = '✖ ' + err.message;
-  } finally {
-    usBusy = false; btn.disabled = false;
-  }
-});
-
 function renderSavings(){
-  renderUseSavings();
   const totalAhorro = DATA.savingsLedger.filter(s=>s.bucket==='ahorro_mensual').reduce((s,x)=>s+Number(x.amount),0);
   const totalAmort = DATA.savingsLedger.filter(s=>s.bucket==='ahorro_amortizacion').reduce((s,x)=>s+Number(x.amount),0);
   document.getElementById('savings-summary').innerHTML = `
